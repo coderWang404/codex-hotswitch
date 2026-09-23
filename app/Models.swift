@@ -134,3 +134,28 @@ struct RemoteStatusResult: Codable {
     let ok: Bool
     let remote: RemoteSyncInfo
 }
+
+struct CcSwitchHostInfo: Codable {
+    let host: String
+    let label: String
+    let ok: Bool
+    let changed: Bool
+    let pending: Bool
+    let providerCount: Int?
+    let error: String?
+}
+
+struct CcSwitchRemoteInfo: Codable {
+    let hosts: [CcSwitchHostInfo]
+}
+
+struct CcSwitchSyncResult: Codable {
+    let ok: Bool
+    let fingerprint: String?
+    let remote: CcSwitchRemoteInfo
+}
+
+struct FingerprintResult: Codable {
+    let ok: Bool
+    let fingerprint: String
+}

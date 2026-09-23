@@ -295,7 +295,7 @@ async function readRemoteConfig(entry) {
   return Buffer.from(encoded.slice("CODEX_CFG_B64:".length), "base64").toString("utf8");
 }
 
-function sshArgs(entry, program) {
+export function sshArgs(entry, program) {
   const payload = Buffer.from(program, "utf8").toString("base64");
   const args = ["-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=12"];
   if (entry.port) args.push("-p", String(entry.port));

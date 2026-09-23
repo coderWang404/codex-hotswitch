@@ -138,37 +138,56 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             status.isEnabled = false
             menu.addItem(status)
         }
-        menu.addItem(.separator())
 
-        let openWindow = NSMenuItem(title: "打开主窗口", action: #selector(showWindow), keyEquivalent: "")
-        openWindow.target = self
-        menu.addItem(openWindow)
-
-        addUtilityItems(menu)
-        menu.addItem(.separator())
-        let quit = NSMenuItem(title: "退出 Codex 热切换", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
-        menu.addItem(quit)
-    }
-
-    private func addUtilityItems(_ menu: NSMenu) {
-        let reload = NSMenuItem(title: "重新加载 Codex", action: #selector(reloadNow), keyEquivalent: "r")
+        menu.addItem(.sectionHeader(title: "Codex"))
+        let openCodex = NSMenuItem(title: "打开 Codex", action: #selector(showCodexPage), keyEquivalent: "")
+        openCodex.target = self
+        menu.addItem(openCodex)
+        let reload = NSMenuItem(title: "重新加载", action: #selector(reloadNow), keyEquivalent: "r")
         reload.target = self
         menu.addItem(reload)
-
-        let watch = NSMenuItem(title: "自动跟随切换", action: #selector(toggleWatchFromMenu), keyEquivalent: "")
+        let watch = NSMenuItem(title: "自动跟随", action: #selector(toggleWatchFromMenu), keyEquivalent: "")
         watch.target = self
         watch.state = watcher.isRunning ? .on : .off
         menu.addItem(watch)
+        let remote = NSMenuItem(title: "远程同步", action: #selector(toggleRemoteFromMenu), keyEquivalent: "")
+        remote.target = self
+        remote.state = windowController.remoteSyncIsOn ? .on : .off
+        menu.addItem(remote)
+        for line in windowController.barHostLines() {
+            let item = NSMenuItem(title: "\(line.label)  ·  \(line.codex)", action: nil, keyEquivalent: "")
+            item.isEnabled = false
+            menu.addItem(item)
+        }
 
+        menu.addItem(.sectionHeader(title: "cc-switch"))
+        let openCc = NSMenuItem(title: "打开 cc-switch", action: #selector(showCcPage), keyEquivalent: "")
+        openCc.target = self
+        menu.addItem(openCc)
+        let ccSync = NSMenuItem(title: "实时同步", action: #selector(toggleCcFromMenu), keyEquivalent: "")
+        ccSync.target = self
+        ccSync.state = windowController.ccSyncIsOn ? .on : .off
+        menu.addItem(ccSync)
+        let check = NSMenuItem(title: "立即检查", action: #selector(checkCcFromMenu), keyEquivalent: "")
+        check.target = self
+        menu.addItem(check)
+        for line in windowController.barHostLines() {
+            let item = NSMenuItem(title: "\(line.label)  ·  \(line.ccswitch)", action: nil, keyEquivalent: "")
+            item.isEnabled = false
+            menu.addItem(item)
+        }
+
+        menu.addItem(.separator())
         let nameItem = NSMenuItem(title: "菜单栏显示供应商名称", action: #selector(toggleShowName), keyEquivalent: "")
         nameItem.target = self
         nameItem.state = (defaults.object(forKey: "showNameInMenuBar") as? Bool ?? false) ? .on : .off
         menu.addItem(nameItem)
-
-        menu.addItem(.separator())
         let doctor = NSMenuItem(title: "环境自检…", action: #selector(showDoctor), keyEquivalent: "")
         doctor.target = self
         menu.addItem(doctor)
+        menu.addItem(.separator())
+        let quit = NSMenuItem(title: "退出 Codex 热切换", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        menu.addItem(quit)
     }
 
     private func headerText() -> String {
@@ -186,6 +205,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self?.currentId = currentId
             self?.updateStatusTitle()
         }
+    }
+
+    @objc private func showCodexPage() {
+        windowController.selectPage(0)
+        showWindow()
+    }
+
+    @objc private func showCcPage() {
+        windowController.selectPage(1)
+        showWindow()
+    }
+
+    @objc private func toggleRemoteFromMenu() {
+        windowController.setRemoteSyncEnabled(!windowController.remoteSyncIsOn)
+        menuStatus = windowController.remoteSyncIsOn ? "已开启 Codex 远程同步" : "已关闭 Codex 远程同步"
+    }
+
+    @objc private func toggleCcFromMenu() {
+        windowController.setCcSyncEnabled(!windowController.ccSyncIsOn)
+        menuStatus = windowController.ccSyncIsOn ? "已开启 cc-switch 实时同步" : "已关闭 cc-switch 实时同步"
+    }
+
+    @objc private func checkCcFromMenu() {
+        windowController.selectPage(1)
+        windowController.checkCcSwitchFromMenu()
+        menuStatus = "正在检查远程 cc-switch…"
+        showWindow()
     }
 
     @objc private func reloadNow() {
@@ -254,8 +300,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         不重启 Codex 应用，热切换 cc-switch 管理的第三方模型供应商。
 
         · 原理：切换配置后只重启 Codex 的 app-server 子进程
-        · 自动跟随：在 cc-switch 里切换后自动生效
-        · 远程同步：内置机器和自己添加的 SSH 机器一起跟上本机供应商
+        · Codex：自动跟随本机供应商，并把供应商配置同步到远程
+        · cc-switch：以本机配置为准，实时同步远程的供应商、端点和当前选择
         · 工具目录：\(backend.scriptPath.map { URL(fileURLWithPath: $0).deletingLastPathComponent().deletingLastPathComponent().path } ?? "未找到")
         """
         alert.alertStyle = .informational
@@ -270,7 +316,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let message: String
             do {
                 let result = try self.backend.doctor()
-                message = result.checks.map { "\($0.ok ? "✅" : "❌") \($0.label)" }.joined(separator: "\n")
+                message = result.checks.map { "\($0.ok ? "通过" : "未通过")  \($0.label)" }.joined(separator: "\n")
             } catch {
                 message = "自检失败: \(error.localizedDescription)"
             }

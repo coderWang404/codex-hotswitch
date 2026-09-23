@@ -16,6 +16,13 @@ final class MainWindowController: NSObject, NSWindowDelegate, NSTableViewDataSou
     private var loginSwitch: NSSwitch!
     private var spinner: NSProgressIndicator!
     private var remoteRows: NSStackView!
+    private var ccRows: NSStackView!
+    private var codexSidebar: SidebarRow!
+    private var ccSidebar: SidebarRow!
+    private var codexPane: NSStackView!
+    private var ccPane: NSStackView!
+    private var ccSyncSwitch: NSSwitch!
+    private var ccStatusLabel: NSTextField!
     private var addRemoteButton: NSButton!
     private let remotes = RemoteStore.shared
 
@@ -24,6 +31,14 @@ final class MainWindowController: NSObject, NSWindowDelegate, NSTableViewDataSou
     private var currentId: String?
     private var liveInfo: LiveInfo?
     private var remoteLive: [String: RemoteHostInfo] = [:]
+    private var ccSwitchLive: [String: CcSwitchHostInfo] = [:]
+    private var ccSwitchTimer: Timer?
+    private var ccSwitchBusy = false
+    private var ccSwitchHash: String?
+    private var ccSwitchPending = Set<String>()
+    private var ccSwitchAttempts: [String: Int] = [:]
+    private var ccSwitchBootstrapped = false
+    private var ccSwitchLastAttempt = Date.distantPast
     private var ccSwitchRunning = false
     private var busy = false
     private var onProvidersChanged: (([ProviderSummary], String?) -> Void)?
@@ -46,28 +61,29 @@ final class MainWindowController: NSObject, NSWindowDelegate, NSTableViewDataSou
 
     private func buildWindow() {
         window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 520, height: 720),
+            contentRect: NSRect(x: 0, y: 0, width: 760, height: 760),
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered,
             defer: false
         )
         window.title = "Codex"
         window.subtitle = "供应商热切换"
-        window.titlebarSeparatorStyle = .line
-        window.minSize = NSSize(width: 460, height: 520)
+        window.titlebarSeparatorStyle = .automatic
+        window.minSize = NSSize(width: 700, height: 560)
+        window.isRestorable = false
         window.delegate = self
         window.center()
         window.isReleasedWhenClosed = false
 
         guard let content = window.contentView else { return }
 
-        headerLabel = makeLabel("加载中…", font: .systemFont(ofSize: 22, weight: .bold), color: .labelColor)
+        headerLabel = makeLabel("加载中…", font: .systemFont(ofSize: 20, weight: .semibold), color: .labelColor)
         effectiveLabel = makeLabel("", font: .systemFont(ofSize: 12), color: .secondaryLabelColor)
         effectiveLabel.lineBreakMode = .byTruncatingMiddle
 
         tableView = NSTableView()
         tableView.headerView = nil
-        tableView.rowHeight = 46
+        tableView.rowHeight = 48
         tableView.selectionHighlightStyle = .none
         tableView.backgroundColor = .clear
         tableView.intercellSpacing = NSSize(width: 0, height: 0)
@@ -82,14 +98,15 @@ final class MainWindowController: NSObject, NSWindowDelegate, NSTableViewDataSou
         scroll.documentView = tableView
         scroll.hasVerticalScroller = true
         scroll.drawsBackground = false
+        scroll.scrollerStyle = .overlay
         scroll.automaticallyAdjustsContentInsets = false
-        scroll.contentInsets = NSEdgeInsets(top: 4, left: 0, bottom: 4, right: 0)
+        scroll.contentInsets = NSEdgeInsets(top: 4, left: 0, bottom: 4, right: 12)
 
         reloadButton = NSButton(title: "重新加载", target: self, action: #selector(reloadNow))
         reloadButton.bezelStyle = .rounded
         reloadButton.image = NSImage(systemSymbolName: "arrow.clockwise", accessibilityDescription: "重新加载")
         reloadButton.imagePosition = .imageLeading
-        reloadButton.controlSize = .large
+        reloadButton.controlSize = .regular
 
         watchSwitch = makeSwitch(action: #selector(toggleWatch))
         spinner = NSProgressIndicator()
@@ -98,7 +115,7 @@ final class MainWindowController: NSObject, NSWindowDelegate, NSTableViewDataSou
         spinner.isDisplayedWhenStopped = false
 
         scopePopup = NSPopUpButton()
-        scopePopup.controlSize = .small
+        scopePopup.controlSize = .regular
         scopePopup.addItems(withTitles: ["仅主 app-server", "含 computer-use 会话", "全部（含其它 App）"])
         scopePopup.selectItem(at: scopeIndexFromDefaults())
         scopePopup.target = self
@@ -113,82 +130,139 @@ final class MainWindowController: NSObject, NSWindowDelegate, NSTableViewDataSou
         loginSwitch = makeSwitch(action: #selector(toggleLogin))
         loginSwitch.state = Self.loginItemEnabled() ? .on : .off
 
+        addRemoteButton = linkButton(title: "添加机器", symbol: "plus", action: #selector(addRemote))
+
         remoteRows = NSStackView()
         remoteRows.orientation = .vertical
         remoteRows.alignment = .leading
-        remoteRows.spacing = 8
+        remoteRows.spacing = 0
         rebuildRemoteRows()
-
-        addRemoteButton = NSButton(title: "添加机器", target: self, action: #selector(addRemote))
-        addRemoteButton.bezelStyle = .rounded
-        addRemoteButton.controlSize = .small
-        addRemoteButton.image = NSImage(systemSymbolName: "plus", accessibilityDescription: "添加机器")
-        addRemoteButton.imagePosition = .imageLeading
+        let remoteCard = card(containing: remoteRows, insets: NSEdgeInsets())
 
         statusLabel = makeLabel("", font: .systemFont(ofSize: 12), color: .secondaryLabelColor)
         statusLabel.lineBreakMode = .byWordWrapping
         statusLabel.maximumNumberOfLines = 3
+        statusLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
-        let providerCard = card(containing: scroll, insets: NSEdgeInsets(top: 2, left: 2, bottom: 2, right: 2))
-        let actionRow = NSStackView(views: [reloadButton, flexibleSpace(), labeledSwitch(watchSwitch, title: "自动跟随"), spinner])
+        codexSidebar = SidebarRow(title: "Codex", symbol: "arrow.left.arrow.right")
+        ccSidebar = SidebarRow(title: "cc-switch", symbol: "arrow.triangle.2.circlepath")
+        codexSidebar.onClick = { [weak self] in self?.selectPage(0) }
+        ccSidebar.onClick = { [weak self] in self?.selectPage(1) }
+
+        let providerCard = card(containing: scroll, insets: NSEdgeInsets(top: 4, left: 4, bottom: 4, right: 4))
+        let actionRow = NSStackView(views: [reloadButton, spinner, flexibleSpace(), labeledSwitch(watchSwitch, title: "自动跟随")])
         actionRow.orientation = .horizontal
         actionRow.alignment = .centerY
-        actionRow.spacing = 10
+        actionRow.spacing = 8
 
-        let remoteHeader = NSStackView(views: [
-            makeLabel("远程机器", font: .systemFont(ofSize: 13, weight: .semibold), color: .labelColor),
-            flexibleSpace(),
-            labeledSwitch(remoteSwitch, title: "同步"),
-        ])
-        remoteHeader.orientation = .horizontal
-        remoteHeader.alignment = .centerY
-        let remoteBody = NSStackView(views: [remoteHeader, remoteRows, addRemoteButton])
-        remoteBody.orientation = .vertical
-        remoteBody.alignment = .leading
-        remoteBody.spacing = 10
-        let remoteCard = card(containing: remoteBody)
-
-        let settings = NSStackView(views: [
+        let settings = groupedStack([
             settingsLine("重启范围", scopePopup),
             settingsLine("热重启后聚焦 ChatGPT", focusSwitch),
             settingsLine("登录时启动", loginSwitch),
         ])
-        settings.orientation = .vertical
-        settings.spacing = 8
-        let settingsCard = card(containing: settings)
+        let settingsCard = card(containing: settings, insets: NSEdgeInsets())
 
-        let stack = NSStackView(views: [
-            makeLabel("当前供应商", font: .systemFont(ofSize: 12, weight: .semibold), color: .secondaryLabelColor),
+        let hero = NSStackView(views: [
+            makeLabel("当前供应商", font: .systemFont(ofSize: 13, weight: .semibold), color: .secondaryLabelColor),
             headerLabel,
             effectiveLabel,
-            sectionLabel("供应商"),
-            providerCard,
+        ])
+        hero.orientation = .vertical
+        hero.alignment = .leading
+        hero.spacing = 2
+
+        codexPane = NSStackView(views: [
+            hero,
+            sectionBlock("供应商", providerCard),
             actionRow,
-            sectionLabel("同步"),
-            remoteCard,
-            settingsCard,
+            sectionBlock("远程机器", remoteCard),
+            sectionBlock("通用", settingsCard),
             statusLabel,
         ])
+        codexPane.orientation = .vertical
+        codexPane.alignment = .leading
+        codexPane.spacing = 18
+
+        ccSyncSwitch = makeSwitch(action: #selector(toggleCcSync))
+        ccSyncSwitch.state = (defaults.object(forKey: "syncCcSwitch") as? Bool ?? true) ? .on : .off
+        ccRows = NSStackView()
+        ccRows.orientation = .vertical
+        ccRows.alignment = .leading
+        ccRows.spacing = 0
+        rebuildCcRows()
+        ccStatusLabel = makeLabel("", font: .systemFont(ofSize: 12), color: .secondaryLabelColor)
+        ccStatusLabel.lineBreakMode = .byWordWrapping
+        ccStatusLabel.maximumNumberOfLines = 3
+        ccStatusLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        let ccCard = card(containing: ccRows, insets: NSEdgeInsets())
+        ccPane = NSStackView(views: [
+            sectionBlock("远程机器", ccCard),
+            ccStatusLabel,
+        ])
+        ccPane.orientation = .vertical
+        ccPane.alignment = .leading
+        ccPane.spacing = 10
+
+        let stack = NSStackView(views: [codexPane, ccPane])
         stack.orientation = .vertical
         stack.alignment = .leading
-        stack.spacing = 8
-        stack.edgeInsets = NSEdgeInsets(top: 16, left: 20, bottom: 16, right: 20)
+        stack.spacing = 0
+        stack.edgeInsets = NSEdgeInsets(top: 18, left: 20, bottom: 20, right: 20)
         stack.setContentHuggingPriority(.required, for: .vertical)
         stack.setContentCompressionResistancePriority(.required, for: .vertical)
+        stack.detachesHiddenViews = true
         stack.translatesAutoresizingMaskIntoConstraints = false
 
         let page = NSScrollView()
-        page.drawsBackground = false
+        page.drawsBackground = true
+        page.backgroundColor = Chrome.page
+        page.scrollerStyle = .overlay
         page.hasVerticalScroller = true
         page.autohidesScrollers = true
         page.documentView = stack
         page.translatesAutoresizingMaskIntoConstraints = false
+        let sidebar = NSVisualEffectView()
+        sidebar.material = .sidebar
+        sidebar.blendingMode = .behindWindow
+        sidebar.state = .followsWindowActiveState
+        sidebar.translatesAutoresizingMaskIntoConstraints = false
+        let sidebarRows = NSStackView(views: [codexSidebar, ccSidebar])
+        sidebarRows.orientation = .vertical
+        sidebarRows.alignment = .leading
+        sidebarRows.spacing = 2
+        sidebarRows.edgeInsets = NSEdgeInsets(top: 12, left: 8, bottom: 12, right: 8)
+        sidebarRows.translatesAutoresizingMaskIntoConstraints = false
+        sidebar.addSubview(sidebarRows)
+        let divider = NSBox()
+        divider.boxType = .separator
+        divider.translatesAutoresizingMaskIntoConstraints = false
+        divider.setContentHuggingPriority(.defaultLow, for: .vertical)
+        divider.setContentCompressionResistancePriority(.defaultLow, for: .vertical)
+        sidebar.setContentHuggingPriority(.defaultLow, for: .vertical)
+        page.setContentHuggingPriority(.defaultLow, for: .vertical)
+        content.addSubview(sidebar)
+        content.addSubview(divider)
         content.addSubview(page)
 
         let clip = page.contentView
         NSLayoutConstraint.activate([
+            sidebar.topAnchor.constraint(equalTo: content.topAnchor),
+            sidebar.leadingAnchor.constraint(equalTo: content.leadingAnchor),
+            sidebar.bottomAnchor.constraint(equalTo: content.bottomAnchor),
+            sidebar.widthAnchor.constraint(equalToConstant: 212),
+            sidebarRows.topAnchor.constraint(equalTo: sidebar.topAnchor),
+            sidebarRows.leadingAnchor.constraint(equalTo: sidebar.leadingAnchor),
+            sidebarRows.trailingAnchor.constraint(equalTo: sidebar.trailingAnchor),
+            codexSidebar.widthAnchor.constraint(equalTo: sidebarRows.widthAnchor, constant: -16),
+            ccSidebar.widthAnchor.constraint(equalTo: sidebarRows.widthAnchor, constant: -16),
+            codexSidebar.heightAnchor.constraint(equalToConstant: 48),
+            ccSidebar.heightAnchor.constraint(equalToConstant: 48),
+            divider.topAnchor.constraint(equalTo: content.topAnchor),
+            divider.bottomAnchor.constraint(equalTo: content.bottomAnchor),
+            divider.leadingAnchor.constraint(equalTo: sidebar.trailingAnchor),
+            divider.widthAnchor.constraint(equalToConstant: 1),
             page.topAnchor.constraint(equalTo: content.topAnchor),
-            page.leadingAnchor.constraint(equalTo: content.leadingAnchor),
+            page.leadingAnchor.constraint(equalTo: divider.trailingAnchor),
             page.trailingAnchor.constraint(equalTo: content.trailingAnchor),
             page.bottomAnchor.constraint(equalTo: content.bottomAnchor),
             stack.topAnchor.constraint(equalTo: clip.topAnchor),
@@ -200,14 +274,22 @@ final class MainWindowController: NSObject, NSWindowDelegate, NSTableViewDataSou
                 bottom.priority = .defaultLow
                 return bottom
             }(),
-            providerCard.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -40),
-            remoteCard.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -40),
-            settingsCard.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -40),
-            actionRow.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -40),
+            codexPane.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -40),
+            ccPane.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -40),
+            providerCard.widthAnchor.constraint(equalTo: codexPane.widthAnchor),
+            remoteCard.widthAnchor.constraint(equalTo: codexPane.widthAnchor),
+            settingsCard.widthAnchor.constraint(equalTo: codexPane.widthAnchor),
+            actionRow.widthAnchor.constraint(equalTo: codexPane.widthAnchor),
+            statusLabel.widthAnchor.constraint(equalTo: codexPane.widthAnchor),
+            ccCard.widthAnchor.constraint(equalTo: ccPane.widthAnchor),
+            ccStatusLabel.widthAnchor.constraint(equalTo: ccPane.widthAnchor),
             scroll.heightAnchor.constraint(equalToConstant: 220),
         ])
 
+        showPage(defaults.integer(forKey: "mainPage") == 1 ? 1 : 0)
+        window.setContentSize(NSSize(width: 760, height: 720))
         window.makeFirstResponder(tableView)
+        if ccSyncEnabled() { startCcSwitchFollow() }
     }
 
     private func makeLabel(_ text: String, font: NSFont, color: NSColor) -> NSTextField {
@@ -219,9 +301,28 @@ final class MainWindowController: NSObject, NSWindowDelegate, NSTableViewDataSou
     }
 
     private func sectionLabel(_ text: String) -> NSTextField {
-        let label = makeLabel(text, font: .systemFont(ofSize: 13, weight: .semibold), color: .secondaryLabelColor)
+        let label = makeLabel(text, font: .systemFont(ofSize: 13, weight: .bold), color: .labelColor)
         label.translatesAutoresizingMaskIntoConstraints = false
         return label
+    }
+
+    private func sectionBlock(_ title: String, _ content: NSView) -> NSStackView {
+        let block = NSStackView(views: [sectionLabel(title), content])
+        block.orientation = .vertical
+        block.alignment = .leading
+        block.spacing = 6
+        return block
+    }
+
+    private func linkButton(title: String, symbol: String, action: Selector) -> NSButton {
+        let button = NSButton(title: title, target: self, action: action)
+        button.bezelStyle = .inline
+        button.isBordered = false
+        button.contentTintColor = .controlAccentColor
+        button.image = NSImage(systemSymbolName: symbol, accessibilityDescription: title)
+        button.imagePosition = .imageLeading
+        button.font = .systemFont(ofSize: 13)
+        return button
     }
 
     private func makeSwitch(action: Selector) -> NSSwitch {
@@ -241,6 +342,14 @@ final class MainWindowController: NSObject, NSWindowDelegate, NSTableViewDataSou
         return row
     }
 
+    private func hugLeading(_ view: NSView) -> NSView {
+        view.setContentHuggingPriority(.required, for: .horizontal)
+        let row = NSStackView(views: [view, flexibleSpace()])
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        return row
+    }
+
     private func flexibleSpace() -> NSView {
         let view = NSView()
         view.setContentHuggingPriority(.defaultLow, for: .horizontal)
@@ -253,6 +362,54 @@ final class MainWindowController: NSObject, NSWindowDelegate, NSTableViewDataSou
         row.orientation = .horizontal
         row.alignment = .centerY
         return row
+    }
+
+    private func groupedStack(_ rows: [NSView]) -> NSStackView {
+        let stack = NSStackView()
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 0
+        for row in rows { addGrouped(stack, row) }
+        return stack
+    }
+
+    private func addGrouped(_ stack: NSStackView, _ view: NSView) {
+        if !stack.arrangedSubviews.isEmpty {
+            let line = separatorRow()
+            stack.addArrangedSubview(line)
+            line.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+        }
+        let row = padded(view, NSEdgeInsets(top: 8, left: 14, bottom: 8, right: 12))
+        stack.addArrangedSubview(row)
+        row.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+    }
+
+    private func padded(_ content: NSView, _ insets: NSEdgeInsets) -> NSView {
+        let wrap = NSView()
+        content.translatesAutoresizingMaskIntoConstraints = false
+        wrap.addSubview(content)
+        NSLayoutConstraint.activate([
+            content.topAnchor.constraint(equalTo: wrap.topAnchor, constant: insets.top),
+            content.leadingAnchor.constraint(equalTo: wrap.leadingAnchor, constant: insets.left),
+            content.trailingAnchor.constraint(equalTo: wrap.trailingAnchor, constant: -insets.right),
+            content.bottomAnchor.constraint(equalTo: wrap.bottomAnchor, constant: -insets.bottom),
+        ])
+        return wrap
+    }
+
+    private func separatorRow() -> NSView {
+        let wrap = NSView()
+        let line = NSBox()
+        line.boxType = .separator
+        line.translatesAutoresizingMaskIntoConstraints = false
+        wrap.addSubview(line)
+        NSLayoutConstraint.activate([
+            line.leadingAnchor.constraint(equalTo: wrap.leadingAnchor, constant: 14),
+            line.trailingAnchor.constraint(equalTo: wrap.trailingAnchor),
+            line.centerYAnchor.constraint(equalTo: wrap.centerYAnchor),
+            wrap.heightAnchor.constraint(equalToConstant: 1),
+        ])
+        return wrap
     }
 
     private func card(containing view: NSView, insets: NSEdgeInsets = NSEdgeInsets(top: 12, left: 14, bottom: 12, right: 14)) -> NSView {
@@ -274,15 +431,91 @@ final class MainWindowController: NSObject, NSWindowDelegate, NSTableViewDataSou
             remoteRows.removeArrangedSubview(view)
             view.removeFromSuperview()
         }
+        addGrouped(remoteRows, settingsLine("同步这些机器", remoteSwitch))
         if remotes.machines.isEmpty {
-            let empty = makeLabel("还没有远程机器", font: .systemFont(ofSize: 12), color: .tertiaryLabelColor)
-            remoteRows.addArrangedSubview(empty)
-            return
+            addGrouped(remoteRows, makeLabel("还没有远程机器", font: .systemFont(ofSize: 13), color: .tertiaryLabelColor))
+        } else {
+            let dimmed = remoteSwitch.state != .on
+            for machine in remotes.machines {
+                let row = makeRemoteRow(machine)
+                if dimmed { row.alphaValue = 0.45 }
+                addGrouped(remoteRows, row)
+            }
         }
-        for machine in remotes.machines {
-            remoteRows.addArrangedSubview(makeRemoteRow(machine))
+        if addRemoteButton != nil { addGrouped(remoteRows, hugLeading(addRemoteButton)) }
+        rebuildCcRows()
+    }
+
+    private func rebuildCcRows() {
+        guard ccRows != nil, ccSyncSwitch != nil else { return }
+        for view in ccRows.arrangedSubviews {
+            ccRows.removeArrangedSubview(view)
+            view.removeFromSuperview()
         }
-        remoteRows.alphaValue = remoteSwitch.state == .on ? 1 : 0.45
+        addGrouped(ccRows, makeCcSyncRow())
+        if remotes.machines.isEmpty {
+            addGrouped(ccRows, makeLabel("还没有远程机器。可在 Codex 页添加。", font: .systemFont(ofSize: 13), color: .tertiaryLabelColor))
+        } else {
+            let dimmed = !ccSyncEnabled()
+            for machine in remotes.machines {
+                let row = makeCcRow(machine)
+                if dimmed { row.alphaValue = 0.45 }
+                addGrouped(ccRows, row)
+            }
+        }
+        addGrouped(ccRows, hugLeading(linkButton(title: "立即检查", symbol: "arrow.clockwise", action: #selector(checkCcSwitchNow))))
+    }
+
+    private func makeCcSyncRow() -> NSView {
+        let title = makeLabel("实时同步", font: .systemFont(ofSize: 13), color: .labelColor)
+        let detail = makeLabel("以本机 cc-switch 为准。配置一变就推到远程；没连上的机器会等到连上，再检查并更新。", font: .systemFont(ofSize: 12), color: .secondaryLabelColor)
+        detail.lineBreakMode = .byWordWrapping
+        detail.maximumNumberOfLines = 3
+        detail.preferredMaxLayoutWidth = 400
+        detail.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        let texts = NSStackView(views: [title, detail])
+        texts.orientation = .vertical
+        texts.alignment = .leading
+        texts.spacing = 2
+        texts.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        let row = NSStackView(views: [texts, flexibleSpace(), ccSyncSwitch])
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 12
+        return row
+    }
+
+    private func makeCcRow(_ machine: RemoteMachine) -> NSView {
+        let title = NSTextField(labelWithString: machine.label)
+        title.font = .systemFont(ofSize: 13, weight: .medium)
+        let detail = NSTextField(labelWithString: machine.detail)
+        detail.font = .systemFont(ofSize: 12)
+        detail.textColor = .secondaryLabelColor
+        let texts = NSStackView(views: [title, detail])
+        texts.orientation = .vertical
+        texts.alignment = .leading
+        texts.spacing = 1
+        texts.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+        let appearance = ccSwitchAppearance(for: machine)
+        let icon = NSImageView()
+        icon.image = NSImage(systemSymbolName: appearance.symbol, accessibilityDescription: appearance.text)
+        icon.contentTintColor = appearance.tint
+        icon.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 12, weight: .semibold)
+        let state = NSTextField(labelWithString: appearance.text)
+        state.font = .systemFont(ofSize: 12)
+        state.textColor = appearance.tint
+        state.lineBreakMode = .byTruncatingTail
+        let status = NSStackView(views: [icon, state])
+        status.orientation = .horizontal
+        status.alignment = .centerY
+        status.spacing = 4
+
+        let row = NSStackView(views: [texts, flexibleSpace(), status])
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 12
+        return row
     }
 
     private func makeRemoteRow(_ machine: RemoteMachine) -> NSView {
@@ -309,23 +542,24 @@ final class MainWindowController: NSObject, NSWindowDelegate, NSTableViewDataSou
         texts.alignment = .leading
         texts.spacing = 1
 
-        var views: [NSView] = [toggle, texts, flexibleSpace()]
+        var trailing: [NSView] = []
         if machine.builtin {
-            let badge = makeLabel("内置", font: .systemFont(ofSize: 11), color: .tertiaryLabelColor)
-            views.append(badge)
+            trailing.append(makeLabel("内置", font: .systemFont(ofSize: 11), color: .tertiaryLabelColor))
         } else {
             let remove = NSButton()
             remove.bezelStyle = .inline
             remove.isBordered = false
-            remove.image = NSImage(systemSymbolName: "minus.circle", accessibilityDescription: "移除")
+            remove.image = NSImage(systemSymbolName: "trash", accessibilityDescription: "移除")
             remove.imagePosition = .imageOnly
             remove.contentTintColor = .secondaryLabelColor
             remove.target = self
             remove.action = #selector(removeRemote(_:))
             remove.identifier = NSUserInterfaceItemIdentifier(machine.host)
-            views.append(remove)
+            trailing.append(remove)
         }
-        let row = NSStackView(views: views)
+        trailing.append(toggle)
+        texts.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        let row = NSStackView(views: [texts, flexibleSpace()] + trailing)
         row.orientation = .horizontal
         row.alignment = .centerY
         row.spacing = 10
@@ -346,14 +580,8 @@ final class MainWindowController: NSObject, NSWindowDelegate, NSTableViewDataSou
         let provider = providers[row]
         let isCurrent = provider.id == currentId
 
-        let radio = NSImageView()
-        radio.image = NSImage(systemSymbolName: isCurrent ? "largecircle.fill.circle" : "circle",
-                              accessibilityDescription: isCurrent ? "当前" : "")
-        radio.contentTintColor = isCurrent ? .controlAccentColor : .tertiaryLabelColor
-        radio.translatesAutoresizingMaskIntoConstraints = false
-
         let name = NSTextField(labelWithString: provider.name)
-        name.font = .systemFont(ofSize: 13, weight: isCurrent ? .semibold : .regular)
+        name.font = .systemFont(ofSize: 13, weight: isCurrent ? .medium : .regular)
         name.lineBreakMode = .byTruncatingTail
 
         let model = NSTextField(labelWithString: [
@@ -361,23 +589,34 @@ final class MainWindowController: NSObject, NSWindowDelegate, NSTableViewDataSou
             provider.host,
             provider.catalogCount > 0 ? "目录\(provider.catalogCount)" : nil,
         ].compactMap { $0 }.joined(separator: " · "))
-        model.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
+        model.font = .systemFont(ofSize: 12)
         model.textColor = .secondaryLabelColor
-
-        let tag = NSTextField(labelWithString: provider.official ? "官方" : "")
-        tag.font = .systemFont(ofSize: 10)
-        tag.textColor = .tertiaryLabelColor
 
         let textStack = NSStackView(views: [name, model])
         textStack.orientation = .vertical
         textStack.alignment = .leading
         textStack.spacing = 1
+        textStack.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
-        let rowStack = NSStackView(views: [radio, textStack, NSView(), tag])
+        var trailing: [NSView] = []
+        if provider.official {
+            let tag = NSTextField(labelWithString: "官方")
+            tag.font = .systemFont(ofSize: 11)
+            tag.textColor = .tertiaryLabelColor
+            trailing.append(tag)
+        }
+        let mark = NSImageView()
+        mark.image = isCurrent ? NSImage(systemSymbolName: "checkmark", accessibilityDescription: "当前") : nil
+        mark.contentTintColor = .controlAccentColor
+        mark.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 12, weight: .semibold)
+        mark.translatesAutoresizingMaskIntoConstraints = false
+        trailing.append(mark)
+
+        let rowStack = NSStackView(views: [textStack, flexibleSpace()] + trailing)
         rowStack.orientation = .horizontal
         rowStack.alignment = .centerY
         rowStack.spacing = 8
-        rowStack.edgeInsets = NSEdgeInsets(top: 2, left: 8, bottom: 2, right: 8)
+        rowStack.edgeInsets = NSEdgeInsets(top: 2, left: 10, bottom: 2, right: 10)
         rowStack.translatesAutoresizingMaskIntoConstraints = false
 
         let container = NSView()
@@ -387,7 +626,7 @@ final class MainWindowController: NSObject, NSWindowDelegate, NSTableViewDataSou
             rowStack.trailingAnchor.constraint(equalTo: container.trailingAnchor),
             rowStack.topAnchor.constraint(equalTo: container.topAnchor),
             rowStack.bottomAnchor.constraint(equalTo: container.bottomAnchor),
-            radio.widthAnchor.constraint(equalToConstant: 16),
+            mark.widthAnchor.constraint(equalToConstant: 14),
         ])
         if !provider.hasConfig || provider.official {
             container.alphaValue = 0.5
@@ -409,7 +648,7 @@ final class MainWindowController: NSObject, NSWindowDelegate, NSTableViewDataSou
             let alert = NSAlert()
             alert.messageText = "建议在 cc-switch 里切换"
             alert.informativeText = """
-            cc-switch 正在运行。若由本 App 直接改配置，cc-switch 可能把这份配置回填到它认为的当前卡片，            造成卡片内容错位（之前已发生过一次）。
+            cc-switch 正在运行。若由本 App 直接改配置，cc-switch 可能把这份配置回填到它认为的当前卡片，造成卡片内容错位。
 
             推荐：在 cc-switch 里点击「\(provider.name)」，本 App 会自动热重启 Codex，效果完全一样。
             """
@@ -512,6 +751,7 @@ final class MainWindowController: NSObject, NSWindowDelegate, NSTableViewDataSou
         if !notes.isEmpty {
             setStatus("ℹ️ " + notes.joined(separator: "；"))
         }
+        refreshSidebar()
     }
 
     private func performSwitch(_ provider: ProviderSummary, force: Bool = false) {
@@ -650,7 +890,124 @@ final class MainWindowController: NSObject, NSWindowDelegate, NSTableViewDataSou
     @objc private func toggleRemote() {
         defaults.set(remoteSwitch.state == .on, forKey: "syncRemote")
         rebuildRemoteRows()
-        setStatus(remoteSwitch.state == .on ? "已开启远程同步" : "已关闭远程同步")
+        refreshSidebar()
+        setStatus(remoteSwitch.state == .on ? "已开启 Codex 远程同步" : "已关闭 Codex 远程同步")
+    }
+
+    func selectPage(_ index: Int) {
+        let page = index == 1 ? 1 : 0
+        defaults.set(page, forKey: "mainPage")
+        showPage(page)
+    }
+
+    private func showPage(_ index: Int) {
+        codexPane?.isHidden = index != 0
+        ccPane?.isHidden = index != 1
+        window?.subtitle = index == 1 ? "cc-switch 同步" : "供应商热切换"
+        codexSidebar?.selected = index == 0
+        ccSidebar?.selected = index == 1
+        refreshSidebar()
+    }
+
+    private func refreshSidebar() {
+        codexSidebar?.setDetail(codexSidebarDetail())
+        ccSidebar?.setDetail(ccSidebarDetail())
+    }
+
+    private func codexSidebarDetail() -> String {
+        if let provider = providers.first(where: { $0.id == currentId }) {
+            if let model = provider.model, !model.isEmpty { return "\(provider.name) · \(model)" }
+            return provider.name
+        }
+        return "供应商热切换"
+    }
+
+    private func ccSidebarDetail() -> String {
+        guard ccSyncEnabled() else { return "实时同步已关闭" }
+        let enabled = remotes.machines.filter(\.enabled)
+        if enabled.isEmpty { return "没有远程机器" }
+        let lives = enabled.compactMap { ccSwitchLive[$0.host] }
+        if lives.count < enabled.count { return "正在检查…" }
+        let waiting = lives.filter(\.pending).count
+        if waiting > 0 { return "\(waiting) 台等待连接" }
+        let failed = lives.filter { !$0.ok }.count
+        if failed > 0 { return "\(failed) 台需要处理" }
+        return "已与本机一致"
+    }
+
+    func barHostLines() -> [(label: String, codex: String, ccswitch: String)] {
+        remotes.machines.map { machine in
+            let codex: String
+            if !machine.enabled {
+                codex = "已暂停"
+            } else if let live = remoteLive[machine.host] {
+                codex = live.ok ? (live.providerName ?? "已连接") : "未连接"
+            } else {
+                codex = "正在读取"
+            }
+            return (machine.label, codex, ccSwitchAppearance(for: machine).text)
+        }
+    }
+
+    func setRemoteSyncEnabled(_ enabled: Bool) {
+        guard remoteSwitch != nil else {
+            defaults.set(enabled, forKey: "syncRemote")
+            return
+        }
+        guard (remoteSwitch.state == .on) != enabled else { return }
+        remoteSwitch.state = enabled ? .on : .off
+        toggleRemote()
+    }
+
+    func setCcSyncEnabled(_ enabled: Bool) {
+        guard ccSyncSwitch != nil else {
+            defaults.set(enabled, forKey: "syncCcSwitch")
+            return
+        }
+        guard (ccSyncSwitch.state == .on) != enabled else { return }
+        ccSyncSwitch.state = enabled ? .on : .off
+        toggleCcSync()
+    }
+
+    func checkCcSwitchFromMenu() {
+        checkCcSwitchNow()
+    }
+
+    var remoteSyncIsOn: Bool { syncRemoteEnabled() }
+    var ccSyncIsOn: Bool { ccSyncEnabled() }
+
+    @objc private func toggleCcSync() {
+        defaults.set(ccSyncSwitch.state == .on, forKey: "syncCcSwitch")
+        rebuildCcRows()
+        if ccSyncSwitch.state == .on {
+            ccSwitchBootstrapped = false
+            startCcSwitchFollow()
+            setCcStatus("已开启实时同步")
+        } else {
+            stopCcSwitchFollow()
+            setCcStatus("已关闭实时同步")
+        }
+        refreshSidebar()
+    }
+
+    @objc private func checkCcSwitchNow() {
+        guard !ccSwitchBusy else { return }
+        ccSwitchBootstrapped = false
+        ccSwitchPending.removeAll()
+        setCcStatus("正在按本机检查远程 cc-switch…")
+        if ccSyncSwitch.state == .on {
+            startCcSwitchFollow()
+        }
+        tickCcSwitchFollow()
+    }
+
+    private func ccSyncEnabled() -> Bool {
+        if ccSyncSwitch != nil { return ccSyncSwitch.state == .on }
+        return defaults.object(forKey: "syncCcSwitch") as? Bool ?? true
+    }
+
+    private func setCcStatus(_ text: String) {
+        ccStatusLabel?.stringValue = text
     }
 
     private func syncRemoteEnabled() -> Bool {
@@ -677,6 +1034,107 @@ final class MainWindowController: NSObject, NSWindowDelegate, NSTableViewDataSou
         presentAddSheet()
     }
 
+    private func ccSwitchAppearance(for machine: RemoteMachine) -> (symbol: String, tint: NSColor, text: String) {
+        guard machine.enabled else { return ("pause.circle", .tertiaryLabelColor, "已暂停") }
+        guard ccSyncEnabled() else { return ("pause.circle", .tertiaryLabelColor, "已关闭") }
+        guard let live = ccSwitchLive[machine.host] else { return ("arrow.triangle.2.circlepath", .secondaryLabelColor, "正在检查…") }
+        if live.pending {
+            let waiting = live.error == "等待连接" || live.error == nil
+            return ("clock", .secondaryLabelColor, waiting ? "等待连接" : (live.error ?? "等待连接"))
+        }
+        if !live.ok { return ("exclamationmark.circle", .systemRed, live.error.map { "失败：\($0)" } ?? "失败") }
+        if live.changed { return ("checkmark.circle.fill", .systemGreen, "已按本机更新") }
+        return ("checkmark.circle.fill", .systemGreen, "已与本机一致")
+    }
+
+    private func startCcSwitchFollow() {
+        guard ccSwitchTimer == nil else { return }
+        let timer = Timer(timeInterval: 1.5, repeats: true) { [weak self] _ in
+            self?.tickCcSwitchFollow()
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        ccSwitchTimer = timer
+        tickCcSwitchFollow()
+    }
+
+    private func stopCcSwitchFollow() {
+        ccSwitchTimer?.invalidate()
+        ccSwitchTimer = nil
+        ccSwitchBusy = false
+    }
+
+    private func tickCcSwitchFollow() {
+        guard ccSyncEnabled(), !ccSwitchBusy else { return }
+        let previous = ccSwitchHash
+        let bootstrapped = ccSwitchBootstrapped
+        let pending = ccSwitchPending
+        let lastAttempt = ccSwitchLastAttempt
+        ccSwitchBusy = true
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            guard let self else { return }
+            guard let hash = try? self.backend.ccSwitchFingerprint() else {
+                DispatchQueue.main.async { self.ccSwitchBusy = false }
+                return
+            }
+            let localChanged = hash != previous
+            let retryDue = !pending.isEmpty && Date().timeIntervalSince(lastAttempt) > 8
+            guard localChanged || !bootstrapped || retryDue else {
+                DispatchQueue.main.async { self.ccSwitchBusy = false }
+                return
+            }
+            let onlyPending = !localChanged && bootstrapped
+            do {
+                if localChanged { Thread.sleep(forTimeInterval: 0.4) }
+                let stable = try self.backend.ccSwitchFingerprint()
+                let result = try self.backend.syncCcSwitch(hosts: onlyPending ? Array(pending) : nil)
+                DispatchQueue.main.async {
+                    self.applyCcSwitchResult(result, hash: stable, replacePending: !onlyPending)
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    self.ccSwitchBusy = false
+                    self.ccSwitchLastAttempt = Date()
+                }
+            }
+        }
+    }
+
+    private func applyCcSwitchResult(_ result: CcSwitchSyncResult, hash: String, replacePending: Bool) {
+        ccSwitchBusy = false
+        ccSwitchHash = hash
+        ccSwitchBootstrapped = true
+        ccSwitchLastAttempt = Date()
+        if replacePending { ccSwitchPending.removeAll() }
+        var changedState = false
+        for host in result.remote.hosts {
+            let old = ccSwitchLive[host.host]
+            if old?.ok != host.ok || old?.pending != host.pending || old?.changed != host.changed {
+                changedState = true
+            }
+            ccSwitchLive[host.host] = host
+            if host.ok {
+                ccSwitchAttempts[host.host] = 0
+                ccSwitchPending.remove(host.host)
+            } else if host.pending || (ccSwitchAttempts[host.host] ?? 0) < 3 {
+                ccSwitchAttempts[host.host] = (ccSwitchAttempts[host.host] ?? 0) + 1
+                ccSwitchPending.insert(host.host)
+            } else {
+                ccSwitchPending.remove(host.host)
+            }
+        }
+        if changedState { rebuildCcRows() }
+        refreshSidebar()
+        let updated = result.remote.hosts.filter { $0.ok && $0.changed }.map(\.label)
+        if !updated.isEmpty {
+            setCcStatus("已按本机更新 " + updated.joined(separator: "、"))
+        } else if let waiting = result.remote.hosts.first(where: { $0.pending }) {
+            let reason = waiting.error ?? "没连上"
+            setCcStatus("\(waiting.label)：\(reason)。连上后会再检查")
+        } else if result.remote.hosts.allSatisfy(\.ok) {
+            setCcStatus("远程 cc-switch 已与本机一致")
+        }
+    }
+
     private func usageText(for host: String) -> String {
         guard let live = remoteLive[host] else { return "正在读取…" }
         if !live.ok { return live.error ?? "读取失败" }
@@ -701,6 +1159,7 @@ final class MainWindowController: NSObject, NSWindowDelegate, NSTableViewDataSou
                 }
                 self.remoteLive = next
                 self.rebuildRemoteRows()
+                self.refreshSidebar()
             }
         }
     }
@@ -711,6 +1170,7 @@ final class MainWindowController: NSObject, NSWindowDelegate, NSTableViewDataSou
             remoteLive[host.host] = host
         }
         rebuildRemoteRows()
+        refreshSidebar()
     }
 
     private func remoteSummary(_ remote: RemoteSyncInfo?) -> String? {
@@ -919,11 +1379,89 @@ final class MainWindowController: NSObject, NSWindowDelegate, NSTableViewDataSou
 private var addSheetFieldsKey: UInt8 = 0
 private var identityFieldKey: UInt8 = 0
 
+final class SidebarRow: NSView {
+    var onClick: (() -> Void)?
+    var selected = false { didSet { applyStyle() } }
+
+    private let iconView = NSImageView()
+    private let titleField: NSTextField
+    private let detailField: NSTextField
+
+    init(title: String, symbol: String) {
+        titleField = NSTextField(labelWithString: title)
+        detailField = NSTextField(labelWithString: " ")
+        super.init(frame: .zero)
+        titleField.font = .systemFont(ofSize: 13, weight: .medium)
+        titleField.lineBreakMode = .byTruncatingTail
+        detailField.font = .systemFont(ofSize: 11)
+        detailField.lineBreakMode = .byTruncatingTail
+        iconView.image = NSImage(systemSymbolName: symbol, accessibilityDescription: title)
+        iconView.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 15, weight: .medium)
+        iconView.translatesAutoresizingMaskIntoConstraints = false
+
+        let texts = NSStackView(views: [titleField, detailField])
+        texts.orientation = .vertical
+        texts.alignment = .leading
+        texts.spacing = 1
+        texts.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(iconView)
+        addSubview(texts)
+        NSLayoutConstraint.activate([
+            iconView.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 16),
+            iconView.centerYAnchor.constraint(equalTo: centerYAnchor),
+            iconView.widthAnchor.constraint(equalToConstant: 18),
+            texts.leadingAnchor.constraint(equalTo: iconView.trailingAnchor, constant: 8),
+            texts.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
+            texts.centerYAnchor.constraint(equalTo: centerYAnchor),
+        ])
+        setAccessibilityElement(true)
+        setAccessibilityRole(.button)
+        setAccessibilityLabel(title)
+        applyStyle()
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    func setDetail(_ text: String) {
+        detailField.stringValue = text
+        setAccessibilityValue(text)
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        if selected {
+            NSColor.controlAccentColor.setFill()
+            let rect = bounds.insetBy(dx: 6, dy: 2)
+            NSBezierPath(roundedRect: rect, xRadius: 8, yRadius: 8).fill()
+        }
+    }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        bounds.contains(point) ? self : nil
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        onClick?()
+    }
+
+    override func accessibilityPerformPress() -> Bool {
+        onClick?()
+        return true
+    }
+
+    private func applyStyle() {
+        titleField.textColor = selected ? .white : .labelColor
+        detailField.textColor = selected ? NSColor.white.withAlphaComponent(0.86) : .secondaryLabelColor
+        iconView.contentTintColor = selected ? .white : .secondaryLabelColor
+        needsDisplay = true
+    }
+}
+
 final class CardView: NSView {
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         wantsLayer = true
-        layer?.cornerRadius = 12
+        layer?.cornerRadius = 8
+        layer?.masksToBounds = true
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
@@ -931,9 +1469,7 @@ final class CardView: NSView {
     override var wantsUpdateLayer: Bool { true }
 
     override func updateLayer() {
-        layer?.backgroundColor = NSColor.controlBackgroundColor.cgColor
-        layer?.borderWidth = 1
-        layer?.borderColor = NSColor.separatorColor.withAlphaComponent(0.45).cgColor
+        layer?.backgroundColor = Chrome.card.cgColor
     }
 }
 
@@ -945,10 +1481,24 @@ final class ProviderRowView: NSTableRowView {
     override func draw(_ dirtyRect: NSRect) {
         if active {
             NSColor.controlAccentColor.withAlphaComponent(0.14).setFill()
-            let rect = bounds.insetBy(dx: 6, dy: 3)
-            NSBezierPath(roundedRect: rect, xRadius: 8, yRadius: 8).fill()
+            let rect = bounds.insetBy(dx: 4, dy: 2)
+            NSBezierPath(roundedRect: rect, xRadius: 6, yRadius: 6).fill()
         }
         super.draw(dirtyRect)
+    }
+}
+
+enum Chrome {
+    static let page = NSColor(name: "codex.pageBackground") { appearance in
+        appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+            ? NSColor(srgbRed: 0.110, green: 0.110, blue: 0.118, alpha: 1)
+            : NSColor(srgbRed: 0.949, green: 0.949, blue: 0.961, alpha: 1)
+    }
+
+    static let card = NSColor(name: "codex.cardBackground") { appearance in
+        appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+            ? NSColor(srgbRed: 0.173, green: 0.173, blue: 0.180, alpha: 1)
+            : .white
     }
 }
 

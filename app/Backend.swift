@@ -213,6 +213,19 @@ final class Backend {
         return result.remote
     }
 
+    func ccSwitchFingerprint() throws -> String {
+        try decode(FingerprintResult.self, from: run(["ccswitch-fingerprint"], timeout: 20)).fingerprint
+    }
+
+    func syncCcSwitch(hosts: [String]? = nil) throws -> CcSwitchSyncResult {
+        var args = ["sync-ccswitch"]
+        for host in hosts ?? [] {
+            args.append("--host")
+            args.append(host)
+        }
+        return try decode(CcSwitchSyncResult.self, from: run(args, timeout: 90))
+    }
+
     var isReady: Bool { nodePath != nil && scriptPath != nil }
 
     var diagnosticMessage: String? {

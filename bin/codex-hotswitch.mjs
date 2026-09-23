@@ -14,6 +14,8 @@ import { switchProvider, isOfficialProvider } from "../src/switcher.mjs";
 import { reloadAppServers, discoverCodexProcesses, waitForRespawn, selectTargets } from "../src/reloader.mjs";
 import { watchConfig } from "../src/watcher.mjs";
 import { loadRemotes, syncRemotes, inspectRemotes } from "../src/remote-sync.mjs";
+import { syncCcSwitch } from "../src/ccswitch-remote.mjs";
+import { localFingerprint } from "../src/ccswitch-snapshot.mjs";
 import { findCodexBinary, readEffectiveConfig } from "../src/verify-client.mjs";
 import { readFileSync } from "node:fs";
 import { codexConfigPath, codexHome, ccSwitchDbPath } from "../src/paths.mjs";
@@ -28,6 +30,7 @@ const HELP = `codex-hotswitch — 不重启 Codex，热切换第三方模型供�
   codex-hotswitch watch                 持续监控配置，切换后自动热重启（推荐常驻）
   codex-hotswitch sync-remote           把本机供应商配置同步到远程 Codex，并重启远程 app-server
   codex-hotswitch remote-status         查看远程正在使用的供应商和密钥尾号
+  codex-hotswitch sync-ccswitch         把本机 cc-switch 配置同步到远程（连不上则等待重试）
   codex-hotswitch doctor                检查运行环境
 
 选项:
@@ -401,6 +404,15 @@ async function cmdSyncRemote(opts) {
   return { command: "sync-remote", remote };
 }
 
+async function cmdSyncCcSwitch(opts) {
+  const remote = await syncCcSwitch({ dryRun: opts.dryRun, log: opts.log, hosts: opts.hosts });
+  return { command: "sync-ccswitch", fingerprint: remote.fingerprint ?? localFingerprint(), remote };
+}
+
+function cmdCcSwitchFingerprint() {
+  return { command: "ccswitch-fingerprint", fingerprint: localFingerprint() };
+}
+
 async function cmdRemoteStatus(opts) {
   const remote = await inspectRemotes();
   for (const host of remote.hosts) {
@@ -476,6 +488,7 @@ async function main() {
       "no-remote": { type: "boolean", default: false },
       "dry-run": { type: "boolean", default: false },
       json: { type: "boolean", default: false },
+      host: { type: "string", multiple: true },
       focus: { type: "boolean" },
       "no-focus": { type: "boolean", default: false },
       help: { type: "boolean", short: "h", default: false },
@@ -496,6 +509,7 @@ async function main() {
     force: values.force,
     dryRun: values["dry-run"],
     focus: values["no-focus"] ? false : values.focus !== false,
+    hosts: values.host ?? [],
   };
 
   const [command, arg] = positionals;
@@ -525,6 +539,12 @@ async function main() {
       break;
     case "remote-status":
       result = await cmdRemoteStatus(opts);
+      break;
+    case "sync-ccswitch":
+      result = await cmdSyncCcSwitch(opts);
+      break;
+    case "ccswitch-fingerprint":
+      result = cmdCcSwitchFingerprint();
       break;
     case "watch":
       result = await cmdWatch(opts);
