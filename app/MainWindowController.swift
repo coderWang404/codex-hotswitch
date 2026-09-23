@@ -1436,7 +1436,8 @@ final class SidebarRow: NSView {
     }
 
     override func hitTest(_ point: NSPoint) -> NSView? {
-        bounds.contains(point) ? self : nil
+        let local = convert(point, from: superview)
+        return bounds.contains(local) ? self : nil
     }
 
     override func mouseDown(with event: NSEvent) {
