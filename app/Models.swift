@@ -159,3 +159,40 @@ struct FingerprintResult: Codable {
     let ok: Bool
     let fingerprint: String
 }
+
+struct ClaudeLiveInfo: Codable {
+    let baseUrl: String?
+    let host: String?
+    let tokenTail: String?
+    let provider: String?
+    let scheme: String?
+    let liveProviderId: String?
+}
+
+struct ClaudeListResult: Codable {
+    let ok: Bool
+    let currentId: String?
+    let providers: [ProviderSummary]
+    let live: ClaudeLiveInfo?
+    let ccSwitchRunning: Bool?
+}
+
+struct ClaudeReloadDetail: Codable {
+    let wasRunning: Bool?
+    let restarted: Bool?
+    let pid: Int?
+    let dryRun: Bool?
+}
+
+struct ClaudeSwitchResult: Codable {
+    let ok: Bool
+    let provider: ProviderSummary?
+    let reload: ClaudeReloadDetail?
+    let error: String?
+}
+
+struct ClaudeReloadResult: Codable {
+    let ok: Bool
+    let current: ProviderRef?
+    let reload: ClaudeReloadDetail?
+}

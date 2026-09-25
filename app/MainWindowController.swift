@@ -18,9 +18,16 @@ final class MainWindowController: NSObject, NSWindowDelegate, NSTableViewDataSou
     private var remoteRows: NSStackView!
     private var ccRows: NSStackView!
     private var codexSidebar: SidebarRow!
+    private var claudeSidebar: SidebarRow!
     private var ccSidebar: SidebarRow!
     private var codexPane: NSStackView!
+    private var claudePane: NSStackView!
     private var ccPane: NSStackView!
+    private var claudeTableView: NSTableView!
+    private var claudeHeaderLabel: NSTextField!
+    private var claudeEffectiveLabel: NSTextField!
+    private var claudeStatusLabel: NSTextField!
+    private var claudeWatchSwitch: NSSwitch!
     private var ccSyncSwitch: NSSwitch!
     private var ccStatusLabel: NSTextField!
     private var addRemoteButton: NSButton!
@@ -28,7 +35,10 @@ final class MainWindowController: NSObject, NSWindowDelegate, NSTableViewDataSou
 
     private let backend = Backend.shared
     private var providers: [ProviderSummary] = []
+    private var claudeProviders: [ProviderSummary] = []
     private var currentId: String?
+    private var claudeCurrentId: String?
+    private var claudeLive: ClaudeLiveInfo?
     private var liveInfo: LiveInfo?
     private var remoteLive: [String: RemoteHostInfo] = [:]
     private var ccSwitchLive: [String: CcSwitchHostInfo] = [:]
@@ -53,6 +63,7 @@ final class MainWindowController: NSObject, NSWindowDelegate, NSTableViewDataSou
         NSApp.activate(ignoringOtherApps: true)
         window.makeKeyAndOrderFront(nil)
         refresh()
+        refreshClaude()
     }
 
     func hide() { window?.orderOut(nil) }
@@ -145,8 +156,10 @@ final class MainWindowController: NSObject, NSWindowDelegate, NSTableViewDataSou
         statusLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
         codexSidebar = SidebarRow(title: "Codex", symbol: "arrow.left.arrow.right")
+        claudeSidebar = SidebarRow(title: "Claude Desktop", symbol: "bubble.left.and.bubble.right")
         ccSidebar = SidebarRow(title: "cc-switch", symbol: "arrow.triangle.2.circlepath")
         codexSidebar.onClick = { [weak self] in self?.selectPage(0) }
+        claudeSidebar.onClick = { [weak self] in self?.selectPage(2) }
         ccSidebar.onClick = { [weak self] in self?.selectPage(1) }
 
         let providerCard = card(containing: scroll, insets: NSEdgeInsets(top: 4, left: 4, bottom: 4, right: 4))
@@ -203,7 +216,59 @@ final class MainWindowController: NSObject, NSWindowDelegate, NSTableViewDataSou
         ccPane.alignment = .leading
         ccPane.spacing = 10
 
-        let stack = NSStackView(views: [codexPane, ccPane])
+        claudeTableView = NSTableView()
+        claudeTableView.headerView = nil
+        claudeTableView.rowHeight = 48
+        claudeTableView.selectionHighlightStyle = .none
+        claudeTableView.backgroundColor = .clear
+        claudeTableView.intercellSpacing = NSSize(width: 0, height: 0)
+        claudeTableView.addTableColumn(NSTableColumn(identifier: NSUserInterfaceItemIdentifier("claude")))
+        claudeTableView.dataSource = self
+        claudeTableView.delegate = self
+        claudeTableView.target = self
+        claudeTableView.action = #selector(claudeRowClicked)
+        claudeTableView.style = .plain
+        let claudeScroll = NSScrollView()
+        claudeScroll.documentView = claudeTableView
+        claudeScroll.hasVerticalScroller = true
+        claudeScroll.drawsBackground = false
+        claudeScroll.scrollerStyle = .overlay
+        let claudeCard = card(containing: claudeScroll, insets: NSEdgeInsets(top: 4, left: 4, bottom: 4, right: 4))
+        claudeHeaderLabel = makeLabel("加载中…", font: .systemFont(ofSize: 20, weight: .semibold), color: .labelColor)
+        claudeEffectiveLabel = makeLabel("", font: .systemFont(ofSize: 12), color: .secondaryLabelColor)
+        claudeEffectiveLabel.lineBreakMode = .byTruncatingMiddle
+        claudeStatusLabel = makeLabel("", font: .systemFont(ofSize: 12), color: .secondaryLabelColor)
+        claudeStatusLabel.lineBreakMode = .byWordWrapping
+        claudeStatusLabel.maximumNumberOfLines = 3
+        claudeWatchSwitch = makeSwitch(action: #selector(toggleClaudeWatch))
+        let claudeWatchOn = defaults.object(forKey: "watchClaudeEnabled") as? Bool ?? true
+        claudeWatchSwitch.state = claudeWatchOn ? .on : .off
+        let claudeReload = NSButton(title: "重新打开", target: self, action: #selector(reloadClaudeNow))
+        claudeReload.bezelStyle = .rounded
+        claudeReload.image = NSImage(systemSymbolName: "arrow.clockwise", accessibilityDescription: "重新打开")
+        claudeReload.imagePosition = .imageLeading
+        let claudeActions = NSStackView(views: [claudeReload, flexibleSpace(), labeledSwitch(claudeWatchSwitch, title: "自动跟随")])
+        claudeActions.orientation = .horizontal
+        claudeActions.alignment = .centerY
+        let claudeHero = NSStackView(views: [
+            makeLabel("当前供应商", font: .systemFont(ofSize: 13, weight: .semibold), color: .secondaryLabelColor),
+            claudeHeaderLabel,
+            claudeEffectiveLabel,
+        ])
+        claudeHero.orientation = .vertical
+        claudeHero.alignment = .leading
+        claudeHero.spacing = 2
+        claudePane = NSStackView(views: [
+            claudeHero,
+            sectionBlock("供应商", claudeCard),
+            claudeActions,
+            claudeStatusLabel,
+        ])
+        claudePane.orientation = .vertical
+        claudePane.alignment = .leading
+        claudePane.spacing = 18
+
+        let stack = NSStackView(views: [codexPane, claudePane, ccPane])
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.spacing = 0
@@ -226,7 +291,7 @@ final class MainWindowController: NSObject, NSWindowDelegate, NSTableViewDataSou
         sidebar.blendingMode = .behindWindow
         sidebar.state = .followsWindowActiveState
         sidebar.translatesAutoresizingMaskIntoConstraints = false
-        let sidebarRows = NSStackView(views: [codexSidebar, ccSidebar])
+        let sidebarRows = NSStackView(views: [codexSidebar, claudeSidebar, ccSidebar])
         sidebarRows.orientation = .vertical
         sidebarRows.alignment = .leading
         sidebarRows.spacing = 2
@@ -254,8 +319,10 @@ final class MainWindowController: NSObject, NSWindowDelegate, NSTableViewDataSou
             sidebarRows.leadingAnchor.constraint(equalTo: sidebar.leadingAnchor),
             sidebarRows.trailingAnchor.constraint(equalTo: sidebar.trailingAnchor),
             codexSidebar.widthAnchor.constraint(equalTo: sidebarRows.widthAnchor, constant: -16),
+            claudeSidebar.widthAnchor.constraint(equalTo: sidebarRows.widthAnchor, constant: -16),
             ccSidebar.widthAnchor.constraint(equalTo: sidebarRows.widthAnchor, constant: -16),
             codexSidebar.heightAnchor.constraint(equalToConstant: 48),
+            claudeSidebar.heightAnchor.constraint(equalToConstant: 48),
             ccSidebar.heightAnchor.constraint(equalToConstant: 48),
             divider.topAnchor.constraint(equalTo: content.topAnchor),
             divider.bottomAnchor.constraint(equalTo: content.bottomAnchor),
@@ -275,7 +342,12 @@ final class MainWindowController: NSObject, NSWindowDelegate, NSTableViewDataSou
                 return bottom
             }(),
             codexPane.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -40),
+            claudePane.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -40),
             ccPane.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -40),
+            claudeCard.widthAnchor.constraint(equalTo: claudePane.widthAnchor),
+            claudeActions.widthAnchor.constraint(equalTo: claudePane.widthAnchor),
+            claudeStatusLabel.widthAnchor.constraint(equalTo: claudePane.widthAnchor),
+            claudeScroll.heightAnchor.constraint(equalToConstant: 220),
             providerCard.widthAnchor.constraint(equalTo: codexPane.widthAnchor),
             remoteCard.widthAnchor.constraint(equalTo: codexPane.widthAnchor),
             settingsCard.widthAnchor.constraint(equalTo: codexPane.widthAnchor),
@@ -286,7 +358,8 @@ final class MainWindowController: NSObject, NSWindowDelegate, NSTableViewDataSou
             scroll.heightAnchor.constraint(equalToConstant: 220),
         ])
 
-        showPage(defaults.integer(forKey: "mainPage") == 1 ? 1 : 0)
+        let savedPage = defaults.integer(forKey: "mainPage")
+        showPage(savedPage == 1 || savedPage == 2 ? savedPage : 0)
         window.setContentSize(NSSize(width: 760, height: 720))
         window.makeFirstResponder(tableView)
         if ccSyncEnabled() { startCcSwitchFollow() }
@@ -568,17 +641,23 @@ final class MainWindowController: NSObject, NSWindowDelegate, NSTableViewDataSou
 
     // MARK: - 表格
 
-    func numberOfRows(in tableView: NSTableView) -> Int { providers.count }
+    func numberOfRows(in tableView: NSTableView) -> Int {
+        tableView === claudeTableView ? claudeProviders.count : providers.count
+    }
 
     func tableView(_ tableView: NSTableView, rowViewForRow row: Int) -> NSTableRowView? {
         let view = ProviderRowView()
-        view.active = providers[row].id == currentId
+        if tableView === claudeTableView {
+            view.active = claudeProviders[row].id == claudeCurrentId
+        } else {
+            view.active = providers[row].id == currentId
+        }
         return view
     }
 
     func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
-        let provider = providers[row]
-        let isCurrent = provider.id == currentId
+        let provider = tableView === claudeTableView ? claudeProviders[row] : providers[row]
+        let isCurrent = tableView === claudeTableView ? provider.id == claudeCurrentId : provider.id == currentId
 
         let name = NSTextField(labelWithString: provider.name)
         name.font = .systemFont(ofSize: 13, weight: isCurrent ? .medium : .regular)
@@ -879,6 +958,166 @@ final class MainWindowController: NSObject, NSWindowDelegate, NSTableViewDataSou
         watchSwitch.state = running ? .on : .off
     }
 
+    func setClaudeWatchState(_ running: Bool) {
+        guard claudeWatchSwitch != nil else { return }
+        claudeWatchSwitch.state = running ? .on : .off
+    }
+
+    var claudeWatchIsOn: Bool { claudeWatchSwitch?.state == .on }
+
+    @objc private func claudeRowClicked() {
+        let row = claudeTableView.clickedRow
+        guard row >= 0, row < claudeProviders.count, !busy else { return }
+        let provider = claudeProviders[row]
+        if !provider.hasConfig {
+            setClaudeStatus("「\(provider.name)」请在 cc-switch 中切换")
+            return
+        }
+        if ccSwitchRunning {
+            let alert = NSAlert()
+            alert.messageText = "建议在 cc-switch 里切换"
+            alert.informativeText = """
+            cc-switch 正在运行。在那边点击「\(provider.name)」后，本 App 会重新打开 Claude Desktop，让新网关生效。
+            """
+            alert.alertStyle = .warning
+            alert.addButton(withTitle: "打开 cc-switch")
+            alert.addButton(withTitle: "强制切换")
+            alert.addButton(withTitle: "取消")
+            NSApp.activate(ignoringOtherApps: true)
+            let choice = alert.runModal()
+            if choice == .alertFirstButtonReturn {
+                NSWorkspace.shared.open(URL(fileURLWithPath: "/Applications/CC Switch.app"))
+                setClaudeStatus("请在 cc-switch 里点击「\(provider.name)」，本 App 会重新打开 Claude Desktop")
+                return
+            }
+            if choice == .alertSecondButtonReturn {
+                performClaudeSwitch(provider, force: true)
+            }
+            return
+        }
+        performClaudeSwitch(provider)
+    }
+
+    private func performClaudeSwitch(_ provider: ProviderSummary, force: Bool = false) {
+        setBusy(true, status: nil)
+        setClaudeStatus("正在切换到 \(provider.name)…")
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { return }
+            do {
+                let result = try self.backend.claudeSwitch(provider.id, force: force)
+                NotificationCenter.default.post(name: .claudeConfigWrittenFromApp, object: nil)
+                DispatchQueue.main.async {
+                    self.setBusy(false)
+                    self.refreshClaude()
+                    let restarted = result.reload?.restarted == true
+                    self.setClaudeStatus(restarted
+                        ? "✔ 已切换到 \(provider.name)，Claude Desktop 已重新打开"
+                        : "✔ 已写入 \(provider.name)，下次打开 Claude Desktop 时生效")
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    self.setBusy(false)
+                    self.setClaudeStatus("❌ \(error.localizedDescription)")
+                }
+            }
+        }
+    }
+
+    func refreshClaude() {
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { return }
+            do {
+                let result = try self.backend.claudeList()
+                DispatchQueue.main.async {
+                    self.claudeProviders = result.providers
+                    self.claudeCurrentId = result.currentId
+                    self.claudeLive = result.live
+                    self.ccSwitchRunning = result.ccSwitchRunning ?? self.ccSwitchRunning
+                    self.claudeTableView?.reloadData()
+                    self.updateClaudeHeader()
+                    self.refreshSidebar()
+                }
+            } catch {
+                DispatchQueue.main.async { self.setClaudeStatus("❌ \(error.localizedDescription)") }
+            }
+        }
+    }
+
+    private func updateClaudeHeader() {
+        let liveId = claudeLive?.liveProviderId
+        let provider = claudeProviders.first { $0.id == liveId } ?? claudeProviders.first { $0.id == claudeCurrentId }
+        if let provider {
+            claudeHeaderLabel?.stringValue = provider.host.map { "\(provider.name) · \($0)" } ?? provider.name
+        } else {
+            claudeHeaderLabel?.stringValue = "(未知)"
+        }
+        var lines: [String] = []
+        if let host = claudeLive?.host { lines.append("实际网关: \(host)") }
+        if let tail = claudeLive?.tokenTail { lines.append("key …\(tail)") }
+        claudeEffectiveLabel?.stringValue = lines.joined(separator: "   ")
+    }
+
+    @objc private func reloadClaudeNow() {
+        guard !busy else { return }
+        setBusy(true, status: nil)
+        setClaudeStatus("正在重新打开 Claude Desktop…")
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { return }
+            do {
+                let result = try self.backend.claudeReload()
+                DispatchQueue.main.async {
+                    self.setBusy(false)
+                    self.refreshClaude()
+                    self.setClaudeStatus(result.reload?.restarted == true
+                        ? "✔ Claude Desktop 已重新打开，正在使用当前网关"
+                        : "ℹ️ 当前没有运行中的 Claude Desktop，下次打开时生效")
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    self.setBusy(false)
+                    self.setClaudeStatus("❌ \(error.localizedDescription)")
+                }
+            }
+        }
+    }
+
+    func autoReloadClaude(onDone: (() -> Void)? = nil) {
+        guard !busy else { onDone?(); return }
+        setBusy(true, status: nil)
+        setClaudeStatus("检测到 cc-switch 切换，正在重新打开 Claude Desktop…")
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { return }
+            do {
+                let result = try self.backend.claudeReload()
+                DispatchQueue.main.async {
+                    self.setBusy(false)
+                    self.refreshClaude()
+                    self.setClaudeStatus(result.reload?.restarted == true
+                        ? "⚡ 已跟随 cc-switch，Claude Desktop 已重新打开"
+                        : "⚡ 网关配置已更新，下次打开 Claude Desktop 时生效")
+                    onDone?()
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    self.setBusy(false)
+                    self.setClaudeStatus("❌ 自动跟随失败: \(error.localizedDescription)")
+                    onDone?()
+                }
+            }
+        }
+    }
+
+    @objc private func toggleClaudeWatch() {
+        let enabled = claudeWatchSwitch.state == .on
+        defaults.set(enabled, forKey: "watchClaudeEnabled")
+        NotificationCenter.default.post(name: .claudeWatchToggled, object: nil)
+        setClaudeStatus(enabled ? "已开启自动跟随：在 cc-switch 里切换后会重新打开 Claude Desktop" : "已关闭自动跟随")
+    }
+
+    private func setClaudeStatus(_ text: String) {
+        claudeStatusLabel?.stringValue = text
+    }
+
     @objc private func scopeChanged() {
         defaults.set(scopeCode(), forKey: "scope")
     }
@@ -895,23 +1134,33 @@ final class MainWindowController: NSObject, NSWindowDelegate, NSTableViewDataSou
     }
 
     func selectPage(_ index: Int) {
-        let page = index == 1 ? 1 : 0
+        let page = index == 1 || index == 2 ? index : 0
         defaults.set(page, forKey: "mainPage")
         showPage(page)
     }
 
     private func showPage(_ index: Int) {
         codexPane?.isHidden = index != 0
+        claudePane?.isHidden = index != 2
         ccPane?.isHidden = index != 1
-        window?.subtitle = index == 1 ? "cc-switch 同步" : "供应商热切换"
+        window?.subtitle = index == 1 ? "cc-switch 同步" : (index == 2 ? "Claude Desktop" : "供应商热切换")
         codexSidebar?.selected = index == 0
+        claudeSidebar?.selected = index == 2
         ccSidebar?.selected = index == 1
         refreshSidebar()
     }
 
     private func refreshSidebar() {
         codexSidebar?.setDetail(codexSidebarDetail())
+        claudeSidebar?.setDetail(claudeSidebarDetail())
         ccSidebar?.setDetail(ccSidebarDetail())
+    }
+
+    private func claudeSidebarDetail() -> String {
+        if let provider = claudeProviders.first(where: { $0.id == claudeCurrentId }) {
+            return provider.host.map { "\(provider.name) · \($0)" } ?? provider.name
+        }
+        return "跟随 cc-switch"
     }
 
     private func codexSidebarDetail() -> String {
@@ -1231,6 +1480,7 @@ final class MainWindowController: NSObject, NSWindowDelegate, NSTableViewDataSou
         busy = value
         reloadButton.isEnabled = !value
         tableView.isEnabled = !value
+        claudeTableView?.isEnabled = !value
         if value { spinner.startAnimation(nil) } else { spinner.stopAnimation(nil) }
         addRemoteButton?.isEnabled = !value
         if let status { setStatus(status) }
@@ -1506,4 +1756,6 @@ enum Chrome {
 extension Notification.Name {
     static let watchToggled = Notification.Name("codex-hotswitch.watchToggled")
     static let configWrittenFromApp = Notification.Name("codex-hotswitch.configWrittenFromApp")
+    static let claudeWatchToggled = Notification.Name("codex-hotswitch.claudeWatchToggled")
+    static let claudeConfigWrittenFromApp = Notification.Name("codex-hotswitch.claudeConfigWrittenFromApp")
 }

@@ -15,12 +15,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let windowController = MainWindowController()
     private let backend = Backend.shared
     private lazy var watcher = ConfigWatcher(configPath: configPath)
+    private lazy var claudeWatcher = ConfigWatcher(configPath: claudeProfilePath)
     private var providers: [ProviderSummary] = []
     private var currentId: String?
     private var menuStatus: String?
 
     private var configPath: String {
         NSString(string: "~/.codex/config.toml").expandingTildeInPath
+    }
+
+    private var claudeProfilePath: String {
+        NSString(string: "~/Library/Application Support/Claude-3p/configLibrary/00000000-0000-4000-8000-000000157210.json").expandingTildeInPath
     }
 
     private var defaults: UserDefaults { .standard }
@@ -55,12 +60,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self?.updateStatusTitle()
         }
 
+        NotificationCenter.default.addObserver(
+            forName: .claudeConfigWrittenFromApp, object: nil, queue: .main
+        ) { [weak self] _ in
+            self?.claudeWatcher.baselineNow()
+        }
+        NotificationCenter.default.addObserver(
+            forName: .claudeWatchToggled, object: nil, queue: .main
+        ) { [weak self] _ in
+            guard let self else { return }
+            if self.windowController.claudeWatchIsOn {
+                self.startClaudeWatching()
+            } else {
+                self.claudeWatcher.stop()
+            }
+        }
+
         if defaults.bool(forKey: "watchEnabled") { startWatching() }
         windowController.setWatchState(watcher.isRunning)
+        if defaults.object(forKey: "watchClaudeEnabled") as? Bool ?? true { startClaudeWatching() }
+        windowController.setClaudeWatchState(claudeWatcher.isRunning)
     }
 
     func applicationWillTerminate(_ notification: Notification) {
         watcher.stop()
+        claudeWatcher.stop()
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
@@ -160,6 +184,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             menu.addItem(item)
         }
 
+        menu.addItem(.sectionHeader(title: "Claude Desktop"))
+        let openClaude = NSMenuItem(title: "打开 Claude Desktop", action: #selector(showClaudePage), keyEquivalent: "")
+        openClaude.target = self
+        menu.addItem(openClaude)
+        let claudeWatch = NSMenuItem(title: "自动跟随", action: #selector(toggleClaudeWatchFromMenu), keyEquivalent: "")
+        claudeWatch.target = self
+        claudeWatch.state = claudeWatcher.isRunning ? .on : .off
+        menu.addItem(claudeWatch)
+
         menu.addItem(.sectionHeader(title: "cc-switch"))
         let openCc = NSMenuItem(title: "打开 cc-switch", action: #selector(showCcPage), keyEquivalent: "")
         openCc.target = self
@@ -212,9 +245,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         showWindow()
     }
 
+    @objc private func showClaudePage() {
+        windowController.selectPage(2)
+        showWindow()
+    }
+
     @objc private func showCcPage() {
         windowController.selectPage(1)
         showWindow()
+    }
+
+    @objc private func toggleClaudeWatchFromMenu() {
+        if claudeWatcher.isRunning {
+            claudeWatcher.stop()
+            defaults.set(false, forKey: "watchClaudeEnabled")
+            menuStatus = "已关闭 Claude Desktop 自动跟随"
+        } else {
+            startClaudeWatching()
+            menuStatus = "已开启 Claude Desktop 自动跟随"
+        }
+        windowController.setClaudeWatchState(claudeWatcher.isRunning)
+    }
+
+    private func startClaudeWatching() {
+        claudeWatcher.onChanged = { [weak self] in
+            guard let self else { return }
+            self.menuStatus = "检测到 Claude Desktop 网关变化，正在重新打开…"
+            self.windowController.autoReloadClaude { [weak self] in
+                self?.menuStatus = "⚡ Claude Desktop 已跟随切换"
+            }
+        }
+        claudeWatcher.start()
+        defaults.set(true, forKey: "watchClaudeEnabled")
+        menuStatus = "已开启 Claude Desktop 自动跟随"
     }
 
     @objc private func toggleRemoteFromMenu() {
@@ -301,6 +364,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         · 原理：切换配置后只重启 Codex 的 app-server 子进程
         · Codex：自动跟随本机供应商，并把供应商配置同步到远程
+        · Claude Desktop：跟随 cc-switch 的桌面供应商，重新打开应用后生效
         · cc-switch：以本机配置为准，实时同步远程的供应商、端点和当前选择
         · 工具目录：\(backend.scriptPath.map { URL(fileURLWithPath: $0).deletingLastPathComponent().deletingLastPathComponent().path } ?? "未找到")
         """

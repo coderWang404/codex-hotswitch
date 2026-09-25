@@ -16,6 +16,17 @@ import { watchConfig } from "../src/watcher.mjs";
 import { loadRemotes, syncRemotes, inspectRemotes } from "../src/remote-sync.mjs";
 import { syncCcSwitch } from "../src/ccswitch-remote.mjs";
 import { localFingerprint } from "../src/ccswitch-snapshot.mjs";
+import {
+  listClaudeDesktopProviders,
+  currentClaudeDesktopId,
+  findClaudeDesktopProvider,
+  readAppliedProfile,
+  applyClaudeDesktopProvider,
+  syncClaudeDesktopCurrent,
+  restartClaudeDesktop,
+  claudeDesktopSummary,
+  claudeDesktopProfilePath,
+} from "../src/claude-desktop.mjs";
 import { findCodexBinary, readEffectiveConfig } from "../src/verify-client.mjs";
 import { readFileSync } from "node:fs";
 import { codexConfigPath, codexHome, ccSwitchDbPath } from "../src/paths.mjs";
@@ -31,6 +42,10 @@ const HELP = `codex-hotswitch — 不重启 Codex，热切换第三方模型供�
   codex-hotswitch sync-remote           把本机供应商配置同步到远程 Codex，并重启远程 app-server
   codex-hotswitch remote-status         查看远程正在使用的供应商和密钥尾号
   codex-hotswitch sync-ccswitch         把本机 cc-switch 配置同步到远程（连不上则等待重试）
+  codex-hotswitch claude-list            列出 Claude Desktop 供应商
+  codex-hotswitch claude-current         查看 Claude Desktop 正在使用的网关
+  codex-hotswitch claude-switch <名称>   切换 Claude Desktop 供应商并重新打开应用
+  codex-hotswitch claude-reload          cc-switch 已切换后，重新打开 Claude Desktop
   codex-hotswitch doctor                检查运行环境
 
 选项:
@@ -426,6 +441,93 @@ async function cmdRemoteStatus(opts) {
   return { command: "remote-status", remote };
 }
 
+function claudeLiveMatch(providers, profile) {
+  if (!profile?.baseUrl) return null;
+  return providers.find((item) => item.baseUrl === profile.baseUrl && item.tokenTail === profile.tokenTail)
+    ?? providers.find((item) => item.baseUrl === profile.baseUrl)
+    ?? null;
+}
+
+async function cmdClaudeList(opts) {
+  const providers = listClaudeDesktopProviders();
+  const currentId = currentClaudeDesktopId();
+  const profile = readAppliedProfile();
+  const live = claudeLiveMatch(providers, profile);
+  opts.log(`\nClaude Desktop 供应商（${providers.length}）`);
+  for (const provider of providers) {
+    const mark = provider.id === currentId ? "●" : "○";
+    opts.log(`  ${mark} ${provider.name}  ${provider.host ?? "官方登录"}  ${provider.model ?? ""}`.trimEnd());
+  }
+  if (profile?.host) opts.log(`\n正在使用: ${profile.host} · key …${profile.tokenTail ?? "-"}`);
+  return {
+    command: "claude-list",
+    currentId,
+    providers: providers.map(claudeDesktopSummary),
+    live: profile ? { ...profile, liveProviderId: live?.id ?? null } : null,
+    ccSwitchRunning: isCcSwitchRunning(),
+    profilePath: claudeDesktopProfilePath(),
+  };
+}
+
+async function cmdClaudeCurrent(opts) {
+  const providers = listClaudeDesktopProviders();
+  const currentId = currentClaudeDesktopId();
+  const current = providers.find((item) => item.id === currentId) ?? null;
+  const profile = readAppliedProfile();
+  const live = claudeLiveMatch(providers, profile);
+  opts.log(`\ncc-switch 记录: ${current ? `${current.name} (${current.id})` : "(未知)"}`);
+  if (profile) opts.log(`桌面网关: ${profile.host ?? "-"} · key …${profile.tokenTail ?? "-"}`);
+  return {
+    command: "claude-current",
+    current: current ? { id: current.id, name: current.name } : null,
+    profile,
+    liveProviderId: live?.id ?? null,
+    running: true,
+  };
+}
+
+async function cmdClaudeSwitch(query, opts) {
+  const provider = findClaudeDesktopProvider(query);
+  if (!provider) throw new Error(`找不到 Claude Desktop 供应商「${query}」。可用: codex-hotswitch claude-list`);
+  if (!provider.hasConfig) {
+    throw new Error(`「${provider.name}」不能写成直连网关。请在 cc-switch 里切换官方登录或需要本地代理的供应商。`);
+  }
+  if (isCcSwitchRunning() && !opts.force) {
+    throw new Error(
+      `cc-switch 正在运行。请在 cc-switch 里点击「${provider.name}」，本工具的自动跟随会重新打开 Claude Desktop。\n` +
+        `  若仍要由此处切换，请加 --force`,
+    );
+  }
+  opts.log(`\n🔀 Claude Desktop → ${provider.name}`);
+  if (opts.dryRun) {
+    opts.log(`  [dry-run] 将写入 ${provider.host}`);
+    return { command: "claude-switch", dryRun: true, provider: claudeDesktopSummary(provider) };
+  }
+  const profile = applyClaudeDesktopProvider(provider);
+  syncClaudeDesktopCurrent(provider.id);
+  opts.log(`  已写入网关 ${profile.host} · key …${profile.tokenTail ?? "-"}`);
+  let reload = null;
+  if (opts.reload) reload = await restartClaudeDesktop({ log: opts.log });
+  return { command: "claude-switch", provider: claudeDesktopSummary(provider), profile, synced: true, reload };
+}
+
+async function cmdClaudeReload(opts) {
+  const providers = listClaudeDesktopProviders();
+  const currentId = currentClaudeDesktopId();
+  const current = providers.find((item) => item.id === currentId) ?? null;
+  const profile = readAppliedProfile();
+  if (current) opts.log(`\n当前: ${current.name} · ${profile?.host ?? "-"}`);
+  const reload = opts.dryRun
+    ? { dryRun: true, wasRunning: false, restarted: false, pid: null }
+    : await restartClaudeDesktop({ log: opts.log });
+  return {
+    command: "claude-reload",
+    current: current ? { id: current.id, name: current.name } : null,
+    profile,
+    reload,
+  };
+}
+
 async function cmdWatch(opts) {
   await watchConfig({
     intervalMs: 800,
@@ -548,6 +650,19 @@ async function main() {
       break;
     case "watch":
       result = await cmdWatch(opts);
+      break;
+    case "claude-list":
+      result = await cmdClaudeList(opts);
+      break;
+    case "claude-current":
+      result = await cmdClaudeCurrent(opts);
+      break;
+    case "claude-switch":
+      if (!arg) throw new Error("用法: codex-hotswitch claude-switch <名称/ID>");
+      result = await cmdClaudeSwitch(arg, opts);
+      break;
+    case "claude-reload":
+      result = await cmdClaudeReload(opts);
       break;
     case "doctor":
       result = cmdDoctor(opts);
